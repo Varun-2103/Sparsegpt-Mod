@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from quant import *
 from sparsegpt import *
 from modelutils import *
+from graph import *
 
 try:
     import wandb
