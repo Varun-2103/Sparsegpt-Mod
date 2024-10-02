@@ -234,7 +234,7 @@ if __name__ == '__main__':
         help='N for N:M pruning.'
     )
     parser.add_argument(
-        '--prunem', type=int, default 0,
+        '--prunem', type=int, default=0,
         help='M for N:M pruning.'
     )
     parser.add_argument(
