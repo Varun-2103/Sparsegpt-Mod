@@ -293,7 +293,7 @@ if __name__ == '__main__':
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
-        print(dataset)
+        print(dataset,"Here it is!")
         opt_eval(model, testloader, 'cuda' if torch.cuda.is_available() else 'cpu', dataset, args.log_wandb)
 
     if args.save:
