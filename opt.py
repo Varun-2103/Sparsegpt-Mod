@@ -1,8 +1,6 @@
 import time
-
 import torch
 import torch.nn as nn
-
 from quant import *
 from sparsegpt import *
 from modelutils import *
@@ -25,6 +23,10 @@ def get_opt(model):
     model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto')
     model.seqlen = model.config.max_position_embeddings
     return model
+
+# Lists to store times and errors for each pruning step
+pruning_times = []
+pruning_errors = []
 
 @torch.no_grad()
 def opt_sequential(model, dataloader, dev):
@@ -49,8 +51,8 @@ def opt_sequential(model, dataloader, dev):
     cache = {'i': 0, 'attention_mask': None}
 
     class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
+        def _init_(self, module):
+            super()._init_()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
@@ -102,8 +104,15 @@ def opt_sequential(model, dataloader, dev):
         handles = []
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+        
+        # Capture times and errors
         for j in range(args.nsamples):
+            start_time = time.time()  # Start timing
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            end_time = time.time()  # End timing
+            elapsed_time = end_time - start_time
+            pruning_times.append(elapsed_time)  # Save time
+
         for h in handles:
             h.remove()
 
@@ -111,10 +120,19 @@ def opt_sequential(model, dataloader, dev):
             print(i, name)
             print('Pruning ...')
             sparsity = args.sparsity
+            start_time = time.time()  # Start timing
             gpts[name].fasterprune(
                 sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
             )
+            end_time = time.time()  # End timing
+            elapsed_time = end_time - start_time
+            pruning_times.append(elapsed_time)  # Save time
             gpts[name].free()
+
+            # Log the error (example: using norm to track change)
+            error = torch.norm(subset[name].weight - gpts[name].weight).item()
+            pruning_errors.append(error)  # Save error
+            print(f"Error: {error}")
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
@@ -126,6 +144,11 @@ def opt_sequential(model, dataloader, dev):
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
+
+    # Now you have all the data in pruning_times and pruning_errors
+    print(f"Pruning times: {pruning_times}")
+    print(f"Pruning errors: {pruning_errors}")
+
 
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
@@ -153,8 +176,8 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     cache = {'i': 0, 'attention_mask': None}
 
     class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
+        def _init_(self, module):
+            super()._init_()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
@@ -231,7 +254,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     model.config.use_cache = use_cache
 
 
-if __name__ == '__main__':
+if _name_ == '_main_':
     import argparse
     from datautils import *
 
@@ -239,7 +262,7 @@ if __name__ == '__main__':
 
     parser.add_argument(
         'model', type=str, 
-        help='OPT model to load; pass `facebook/opt-X`.'
+        help='OPT model to load; pass facebook/opt-X.'
     )
     parser.add_argument(
         'dataset', type=str, choices=['wikitext2', 'ptb', 'c4'],
@@ -310,7 +333,7 @@ if __name__ == '__main__':
 
     # init W&B logging
     if args.log_wandb:
-        assert has_wandb, "wandb not installed try `pip install wandb`"
+        assert has_wandb, "wandb not installed, try pip install wandb"
         wandb.init(config=args)
 
     model = get_opt(args.model)
@@ -322,7 +345,7 @@ if __name__ == '__main__':
 
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
-        opt_sequential(model, dataloader, DEV)
+        opt_sequential(model, dataloader, 'cuda' if torch.cuda.is_available() else 'cpu')
         for n, p in model.named_parameters():
             print(n, torch.mean((p == 0).float()))
             if 'fc2' in n:
@@ -334,7 +357,7 @@ if __name__ == '__main__':
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print(dataset)
-        opt_eval(model, testloader, DEV, dataset, args.log_wandb)
+        opt_eval(model, testloader, 'cuda' if torch.cuda.is_available() else 'cpu', dataset, args.log_wandb)
 
     if args.save:
         model.save_pretrained(args.save)
