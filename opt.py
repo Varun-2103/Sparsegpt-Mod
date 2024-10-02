@@ -254,7 +254,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     model.config.use_cache = use_cache
 
 
-if _name_ == '_main_':
+if __name__ == '__main__':
     import argparse
     from datautils import *
 
