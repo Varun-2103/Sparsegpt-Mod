@@ -51,8 +51,8 @@ def opt_sequential(model, dataloader, dev):
     cache = {'i': 0, 'attention_mask': None}
 
     class Catcher(nn.Module):
-        def _init_(self, module):
-            super()._init_()
+        def __init__(self, module):
+            super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
