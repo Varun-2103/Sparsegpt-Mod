@@ -11,7 +11,7 @@ try:
     import wandb
     has_wandb = True
 except:
-    has_wandb = False 
+    has_wandb = False
 
 # Lists to store time and error
 time_list = []
@@ -182,9 +182,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         hidden_states = inps[i].unsqueeze(0)
         lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[
-            :, (i * model.seqlen):((i + 1) * model.seqlen)
-        ][:, 1:]
+        shift_labels = testenc[ :, (i * model.seqlen):((i + 1) * model.seqlen)][:, 1:]
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         neg_log_likelihood = loss.float() * model.seqlen
@@ -214,8 +212,7 @@ if __name__ == '__main__':
         help='Where to extract calibration data from.'
     )
     parser.add_argument(
-        '--seed',
-        type=int, default=0, help='Seed for sampling the calibration data.'
+        '--seed', type=int, default=0, help='Seed for sampling the calibration data.'
     )
     parser.add_argument(
         '--nsamples', type=int, default=128,
@@ -258,27 +255,26 @@ if __name__ == '__main__':
         help='Prune all layers with id < this.'
     )
     parser.add_argument(
-        '--prune_only', type=str, default='',
-        help='Prune only layers that contain this text.'
+        '--prune_only', type=str, default='self_attn.k_proj',
+        help='Prune only this part of the model.'
     )
     parser.add_argument(
-       '--invert', action='store_true', 
-       help='Invert subset.'
+        '--invert', action='store_true',
+        help='Prune everything except the specified layers.'
     )
     parser.add_argument(
-       '--save', type=str, default='',
-       help='Path to saved model.'
+        '--save', type=str, default='',
+        help='Save the quantized model under this name.'
     )
     parser.add_argument(
-       '--log_wandb', action='store_true',
-       help='Whether to log to wandb.'
+        '--log_wandb', action='store_true',
+        help='Whether to log results to Weights and Biases'
     )
 
     args = parser.parse_args()
 
-    # init W&B logging
     if args.log_wandb:
-        assert has_wandb, "wandb not installed try pip install wandb"
+        assert has_wandb, "wandb not installed, try pip install wandb"
         wandb.init(config=args)
 
     model = get_opt(args.model)
@@ -290,11 +286,7 @@ if __name__ == '__main__':
 
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
-        opt_sequential(model, dataloader, DEV)
-        for n, p in model.named_parameters():
-            print(n, torch.mean((p == 0).float()))
-            if 'fc2' in n:
-                break
+        opt_sequential(model, dataloader, 'cuda' if torch.cuda.is_available() else 'cpu')
         print(time.time() - tick)
 
     for dataset in ['wikitext2', 'ptb', 'c4']:
@@ -302,14 +294,17 @@ if __name__ == '__main__':
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print(dataset)
-        opt_eval(model, testloader, DEV, dataset, args.log_wandb)
+        opt_eval(model, testloader, 'cuda' if torch.cuda.is_available() else 'cpu', dataset, args.log_wandb)
 
     if args.save:
         model.save_pretrained(args.save)
 
 # Plot the time vs error
-plt.plot(time_list, error_list)
-plt.xlabel('Time (s)')
-plt.ylabel('Error (Perplexity)')
-plt.title('Time vs Error Plot')
-plt.show()
+if len(time_list) > 0 and len(error_list) > 0:
+    plt.plot(time_list, error_list)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Error (Perplexity)')
+    plt.title('Time vs Error Plot')
+    plt.show()
+else:
+    print("No data available to plot.")
