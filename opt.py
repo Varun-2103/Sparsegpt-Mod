@@ -1,6 +1,8 @@
 import time
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
+
 from quant import *
 from sparsegpt import *
 from modelutils import *
@@ -11,6 +13,9 @@ try:
 except:
     has_wandb = False 
 
+# Lists to store time and error
+time_list = []
+error_list = []
 
 def get_opt(model):
     import torch
@@ -23,10 +28,6 @@ def get_opt(model):
     model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto')
     model.seqlen = model.config.max_position_embeddings
     return model
-
-# Lists to store times and errors for each pruning step
-pruning_times = []
-pruning_errors = []
 
 @torch.no_grad()
 def opt_sequential(model, dataloader, dev):
@@ -104,15 +105,8 @@ def opt_sequential(model, dataloader, dev):
         handles = []
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
-        
-        # Capture times and errors
         for j in range(args.nsamples):
-            start_time = time.time()  # Start timing
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-            end_time = time.time()  # End timing
-            elapsed_time = end_time - start_time
-            pruning_times.append(elapsed_time)  # Save time
-
         for h in handles:
             h.remove()
 
@@ -120,19 +114,10 @@ def opt_sequential(model, dataloader, dev):
             print(i, name)
             print('Pruning ...')
             sparsity = args.sparsity
-            start_time = time.time()  # Start timing
             gpts[name].fasterprune(
                 sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
             )
-            end_time = time.time()  # End timing
-            elapsed_time = end_time - start_time
-            pruning_times.append(elapsed_time)  # Save time
             gpts[name].free()
-
-            # Log the error (example: using norm to track change)
-            error = torch.norm(subset[name].weight - gpts[name].weight).item()
-            pruning_errors.append(error)  # Save error
-            print(f"Error: {error}")
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
@@ -144,11 +129,6 @@ def opt_sequential(model, dataloader, dev):
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
-
-    # Now you have all the data in pruning_times and pruning_errors
-    print(f"Pruning times: {pruning_times}")
-    print(f"Pruning errors: {pruning_errors}")
-
 
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
@@ -163,12 +143,8 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
 
     model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
-    if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev) 
-    if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
+    
     layers[0] = layers[0].to(dev)
-
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
         (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
@@ -176,8 +152,8 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     cache = {'i': 0, 'attention_mask': None}
 
     class Catcher(nn.Module):
-        def _init_(self, module):
-            super()._init_()
+        def __init__(self, module):
+            super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
@@ -185,58 +161,25 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
             cache['attention_mask'] = kwargs['attention_mask']
             raise ValueError
     layers[0] = Catcher(layers[0])
+    
+    # Time tracking
+    start_time = time.time()
+
     for i in range(nsamples):
         batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
         try:
             model(batch)
         except ValueError:
             pass
-    layers[0] = layers[0].module
+    
+    elapsed_time = time.time() - start_time
+    time_list.append(elapsed_time)
 
-    layers[0] = layers[0].cpu()
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-    if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.cpu()
-    if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-
-    for i in range(len(layers)):
-        print(i)
-        layer = layers[i].to(dev)
-
-        if args.gmp:
-            subset = find_layers(layer)
-            for name in subset:
-                W = subset[name].weight.data
-                thresh = torch.sort(torch.abs(W.flatten()))[0][int(W.numel() * args.sparsity)]
-                W.data[torch.abs(W.data) <= thresh] = 0
-
-        for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        layers[i] = layer.cpu()
-        del layer
-        torch.cuda.empty_cache()
-        inps, outs = outs, inps
-
-    if model.model.decoder.final_layer_norm is not None:
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
-    if model.model.decoder.project_out is not None:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
-    model.lm_head = model.lm_head.to(dev)
-
+    # Compute the error (loss or perplexity)
     testenc = testenc.to(dev)
     nlls = []
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
-        if model.model.decoder.final_layer_norm is not None:
-            hidden_states = model.model.decoder.final_layer_norm(hidden_states)
-        if model.model.decoder.project_out is not None:
-            hidden_states = model.model.decoder.project_out(hidden_states)
         lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = testenc[
@@ -246,13 +189,15 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
+    
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     print(f"Perplexity: {ppl.item():3f}")
-    if log_wandb:
-         wandb.log({f'{dataset}/perplexity': ppl.item()})
-
+    
+    # Append the error to the list
+    error_list.append(ppl.item())
+    
+    # Restore cache
     model.config.use_cache = use_cache
-
 
 if __name__ == '__main__':
     import argparse
@@ -289,7 +234,7 @@ if __name__ == '__main__':
         help='N for N:M pruning.'
     )
     parser.add_argument(
-        '--prunem', type=int, default=0,
+        '--prunem', type=int, default 0,
         help='M for N:M pruning.'
     )
     parser.add_argument(
@@ -333,7 +278,7 @@ if __name__ == '__main__':
 
     # init W&B logging
     if args.log_wandb:
-        assert has_wandb, "wandb not installed, try pip install wandb"
+        assert has_wandb, "wandb not installed try pip install wandb"
         wandb.init(config=args)
 
     model = get_opt(args.model)
@@ -345,7 +290,7 @@ if __name__ == '__main__':
 
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
-        opt_sequential(model, dataloader, 'cuda' if torch.cuda.is_available() else 'cpu')
+        opt_sequential(model, dataloader, DEV)
         for n, p in model.named_parameters():
             print(n, torch.mean((p == 0).float()))
             if 'fc2' in n:
@@ -357,7 +302,14 @@ if __name__ == '__main__':
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print(dataset)
-        opt_eval(model, testloader, 'cuda' if torch.cuda.is_available() else 'cpu', dataset, args.log_wandb)
+        opt_eval(model, testloader, DEV, dataset, args.log_wandb)
 
     if args.save:
         model.save_pretrained(args.save)
+
+# Plot the time vs error
+plt.plot(time_list, error_list)
+plt.xlabel('Time (s)')
+plt.ylabel('Error (Perplexity)')
+plt.title('Time vs Error Plot')
+plt.show()
