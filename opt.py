@@ -291,7 +291,7 @@ if __name__ == '__main__':
 
     for dataset in ['wikitext2', 'ptb', 'c4']:
         dataloader, testloader = get_loaders(
-            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
+            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
             datasets = ['PTB', 'C4', 'WikiText-2']
         plt.figure(figsize=(8, 6))
         plt.bar(datasets, dataset, color=['blue', 'green', 'orange'])
@@ -305,8 +305,6 @@ if __name__ == '__main__':
         plt.text(i, value + 1, f'{value:.2f}', ha='center')
             # Show plot
             plt.show()
-
-        )
         print(dataset,"Here it is!")
         opt_eval(model, testloader, 'cuda' if torch.cuda.is_available() else 'cpu', dataset, args.log_wandb)
 
