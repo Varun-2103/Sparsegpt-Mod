@@ -12,7 +12,7 @@ from opt import *
 perplexities = []
 for dataset in ['wikitext2', 'ptb', 'c4']:
  dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
-for in range(0,3):
+for i in range(0,3):
 {
  perplexities[i]=dataset;}
 datasets = ['PTB', 'C4', 'WikiText-2']
