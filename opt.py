@@ -7,7 +7,6 @@ from quant import *
 from sparsegpt import *
 from modelutils import *
 from graph import *
-from datautils import *
 
 try:
     import wandb
@@ -19,7 +18,6 @@ except:
 time_list = []
 error_list = []
 
-# Function to get the model
 def get_opt(model):
     import torch
     def skip(*args, **kwargs):
@@ -32,13 +30,107 @@ def get_opt(model):
     model.seqlen = model.config.max_position_embeddings
     return model
 
-# The dataloader function (assuming it's part of datautils or imported properly)
-def get_loaders(dataset, seed, model, seqlen):
-    # Modify this function to return the actual dataloader and testloader
-    dataloader, testloader = DataLoader(...), DataLoader(...)  # Replace with your logic
-    return dataloader, testloader
+@torch.no_grad()
+def opt_sequential(model, dataloader, dev):
+    print('Starting ...')
 
-# Mocked opt_eval (performs evaluation and calculates perplexity)
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.decoder.layers
+
+    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev) 
+    model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
+    if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
+        model.model.decoder.project_out = model.model.decoder.project_out.to(dev) 
+    if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
+        model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
+    layers[0] = layers[0].to(dev)
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {'i': 0, 'attention_mask': None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs['attention_mask']
+            raise ValueError
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+
+    layers[0] = layers[0].cpu()
+    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+    model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+    if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
+        model.model.decoder.project_out = model.model.decoder.project_out.cpu()
+    if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
+        model.model.decoder.project_in = model.model.decoder.project_in.cpu()
+    torch.cuda.empty_cache()
+
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+
+    print('Ready.')
+
+    for i in range(len(layers)):
+        layer = layers[i].to(dev)
+
+        subset = find_layers(layer)
+        
+        gpts = {}
+        for name in subset:
+            if (not (args.minlayer <= i < args.maxlayer and args.prune_only in name)) == (not args.invert):
+              continue
+            gpts[name] = SparseGPT(subset[name])
+            if args.wbits < 16:
+                gpts[name].quantizer = Quantizer()
+                gpts[name].quantizer.configure(
+                    args.wbits, perchannel=True, sym=False, mse=False
+                )
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                gpts[name].add_batch(inp[0].data, out.data)
+            return tmp
+        handles = []
+        for name in gpts:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+        for h in handles:
+            h.remove()
+
+        for name in gpts:
+            print(i, name)
+            print('Pruning ...')
+            sparsity = args.sparsity
+            gpts[name].fasterprune(
+                sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
+            )
+            gpts[name].free()
+
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+
+        layers[i] = layer.cpu()
+        del layer
+        torch.cuda.empty_cache()
+
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache
+
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     print('Evaluating ...')
@@ -100,7 +192,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     print(f"Perplexity: {ppl.item():3f}")
     
-    # Append the error (perplexity) to the list
+    # Append the error to the list
     error_list.append(ppl.item())
     
     # Restore cache
@@ -108,6 +200,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
 
 if __name__ == '__main__':
     import argparse
+    from datautils import *
 
     parser = argparse.ArgumentParser()
 
@@ -127,6 +220,54 @@ if __name__ == '__main__':
         help='Number of calibration data samples.'
     )
     parser.add_argument(
+        '--percdamp', type=float, default=.01,
+        help='Percent of the average Hessian diagonal to use for dampening.'
+    )
+    parser.add_argument(
+        '--sparsity', type=float, default=0,
+        help='Target sparsity'
+    )
+    parser.add_argument(
+        '--prunen', type=int, default=0,
+        help='N for N:M pruning.'
+    )
+    parser.add_argument(
+        '--prunem', type=int, default=0,
+        help='M for N:M pruning.'
+    )
+    parser.add_argument(
+        '--blocksize', type=int, default=128,
+        help='Blocksize to use for adaptive mask selection.'
+    )
+    parser.add_argument(
+        '--gmp', action='store_true',
+        help='Whether to run the GMP baseline.'
+    )
+    parser.add_argument(
+        '--wbits', type=int, default=16,
+        help='Whether to quantize as well.'
+    )
+    parser.add_argument(
+        '--minlayer', type=int, default=-1,
+        help='Prune all layers with id >= this.'
+    )
+    parser.add_argument(
+        '--maxlayer', type=int, default=1000,
+        help='Prune all layers with id < this.'
+    )
+    parser.add_argument(
+        '--prune_only', type=str, default='self_attn.k_proj',
+        help='Prune only this part of the model.'
+    )
+    parser.add_argument(
+        '--invert', action='store_true',
+        help='Prune everything except the specified layers.'
+    )
+    parser.add_argument(
+        '--save', type=str, default='',
+        help='Save the quantized model under this name.'
+    )
+    parser.add_argument(
         '--log_wandb', action='store_true',
         help='Whether to log results to Weights and Biases'
     )
@@ -140,40 +281,30 @@ if __name__ == '__main__':
     model = get_opt(args.model)
     model.eval()
 
-    datasets = ['wikitext2', 'ptb', 'c4']
-    perplexities = []
-    dataset_names = ['WikiText-2', 'PTB', 'C4']
+    dataloader, testloader = get_loaders(
+        args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+    )
 
-    for dataset in datasets:
+    if (args.sparsity or args.prunen) and not args.gmp:
+        tick = time.time()
+        opt_sequential(model, dataloader, 'cuda' if torch.cuda.is_available() else 'cpu')
+        print(time.time() - tick)
+
+    for dataset in ['wikitext2', 'ptb', 'c4']:
         dataloader, testloader = get_loaders(
-            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
-        )
-        print(dataset, "Here it is!")
+            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
+        print(dataset,"Here it is!")
         opt_eval(model, testloader, 'cuda' if torch.cuda.is_available() else 'cpu', dataset, args.log_wandb)
 
-    # Create a bar graph for perplexity
-    plt.figure(figsize=(8, 6))
-    plt.bar(dataset_names, error_list, color=['blue', 'green', 'orange'])
+    if args.save:
+        model.save_pretrained(args.save)
 
-    # Add labels and title
-    plt.xlabel('Datasets')
-    plt.ylabel('Perplexity')
-    plt.title('Perplexity Comparison Across Datasets')
-
-    # Display the values on top of the bars
-    for i, value in enumerate(error_list):
-        plt.text(i, value + 1, f'{value:.2f}', ha='center')
-
-    # Show plot
+# Plot the time vs error
+if len(time_list) > 0 and len(error_list) > 0:
+    plt.plot(time_list, error_list)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Error (Perplexity)')
+    plt.title('Time vs Error Plot')
     plt.show()
-
-    # Optionally, plot time vs error
-    if len(time_list) > 0 and len(error_list) > 0:
-        plt.figure(figsize=(8, 6))
-        plt.plot(time_list, error_list)
-        plt.xlabel('Time (s)')
-        plt.ylabel('Error (Perplexity)')
-        plt.title('Time vs Error Plot')
-        plt.show()
-    else:
-        print("No data available to plot.")
+else:
+    print("No data available to plot.")
