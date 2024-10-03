@@ -8,14 +8,18 @@ from sparsegpt import *
 from modelutils import *
 from opt import *
 
+# Assuming args and model variables are defined elsewhere
+
 # Data
 perplexities = []
-for dataset in ['wikitext2', 'ptb', 'c4']:
- dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
- for i in range(0,3):
-  {
-   perplexities[i]=dataset;}
-datasets = ['PTB', 'C4', 'WikiText-2']
+datasets = ['WikiText-2', 'PTB', 'C4']  # Correct names for display
+
+for dataset in datasets:
+    dataloader, testloader = get_loaders(dataset.lower(), seed=args.seed, model=args.model, seqlen=model.seqlen)
+    # Assuming you have a function to calculate perplexity for the dataset
+    perplexity = calculate_perplexity(model, testloader)  # This function needs to exist
+    perplexities.append(perplexity)
+
 # Create bar graph
 plt.figure(figsize=(8, 6))
 plt.bar(datasets, perplexities, color=['blue', 'green', 'orange'])
